@@ -266,6 +266,7 @@ def sportspose2h36m(
     camera_info: dict,
     times_rot90: int = 0,
     res: tuple = (1920, 1080),
+    return_camera_and_image_coordinates: bool = False,
 ) -> torch.Tensor:
     """
     Converts 3D pose from world coordinates to camera coordinates and then to H36M coordinates.
@@ -275,6 +276,7 @@ def sportspose2h36m(
         camera_info (dict): Camera information dictionary containing extrinsic parameters.
         times_rot90 (int, optional): Number of times the image is rotated by 90 degrees. Defaults to 0.
         res (tuple, optional): Resolution of the image, of the form (width, height). Defaults to (1920, 1080).
+        return_camera_and_image_coordinates (bool, optional): Whether to return the pose in camera and image coordinates. Defaults to False.
 
     Returns:
         torch.Tensor: 3D pose in H36M coordinates, of shape (B, S, J, 3).
@@ -361,7 +363,47 @@ def sportspose2h36m(
             j3d_scaled_image[batch_num, :, :, 2:] / res_w * 2
         )
 
+    if return_camera_and_image_coordinates:
+        return j3d_scaled_image.float(), j3d_camera.float(), j3d_image.float()
     return j3d_scaled_image.float()
+
+
+def denormalize_dections(j3d, res, times_rot90):
+    """
+    Denormalizes model detections in order to be able to compute a MPJPE score.
+    Note that it denormalizes the detections to millimeters and not meters as the original dataset.
+
+    Args:
+        j3d (torch.tensor): 3D pose tensor of shape (B, S, J, 3) or (S, J, 3).
+        res (tuple): Image resolution of the form (width, height).
+        times_rot90 (int): Number of times the image is rotated by 90 degrees.
+
+    Returns:
+        torch.tensor: 3D pose tensor of shape (S, J, 3) after denormalization.
+    """
+    j3d_denorm = j3d.clone()
+
+    # If there is no batch dimension, add one to unify the code
+    if len(j3d_denorm.shape) != 4:
+        j3d_denorm = j3d_denorm[None, ...]
+
+    for batch_num in range(j3d.shape[0]):
+        if times_rot90[batch_num] % 2 == 1:
+            res_h, res_w = res[batch_num, ...]
+        else:
+            res_w, res_h = res[batch_num, ...]
+
+        j3d_denorm[batch_num, :, :, :2] = (
+            (
+                j3d_denorm[batch_num, :, :, :2]
+                + torch.tensor([1, res_h / res_w]).to(j3d_denorm)
+            )
+            * res_w
+            / 2
+        )
+        j3d_denorm[batch_num, :, :, 2:] = j3d_denorm[batch_num, :, :, 2:] * res_w / 2
+
+    return j3d_denorm
 
 
 def reorder_dataparallel_checkpoint(state_dict):
@@ -424,13 +466,18 @@ class MotionBertSportPose(pl.LightningModule):
 
         self.debug_images = debug_images
 
+        # Init vars for validation metric calculation
+        self.val_step_denorm_outputs = []
+        self.val_step_gt = []
+
     def training_step(self, batch, batch_idx):
         # Get camera and 3d pose in world coordinate
-        target3d = sportspose2h36m(
+        target3d, j3d_cam, j3d_image = sportspose2h36m(
             batch["joints_3d"]["data_points"],
             batch["video"]["calibration"]["right"],
             batch["video"]["right"]["numtimesrot90clockwise"],
             batch["video"]["right"]["img_dims"],
+            return_camera_and_image_coordinates=True,
         )
 
         # Ortho project 3D pose to 2D pose for 2D gt - set z to 1 as being confidence in 2D
@@ -491,22 +538,31 @@ class MotionBertSportPose(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         # Get camera and 3d pose in world coordinate
-        target3d = sportspose2h36m(
+        target3d, j3d_cam, j3d_image = sportspose2h36m(
             batch["joints_3d"]["data_points"],
             batch["video"]["calibration"]["right"],
             batch["video"]["right"]["numtimesrot90clockwise"],
             batch["video"]["right"]["img_dims"],
+            return_camera_and_image_coordinates=True,
         )
 
         # Ortho project 3D pose to 2D pose for 2D gt - set z to 1 as being confidence in 2D
         pose2d = target3d.clone()
         pose2d[..., 2] = 1.0
 
-        # Augment / Mask 2D poses
-        # TODO: Add augmentation and masking
-
         # Get 3D pose from model
         output = self.model(pose2d)
+
+        # Get denormalized values for MPJPE
+        output_denorm = denormalize_dections(
+            output,
+            batch["video"]["right"]["img_dims"],
+            batch["video"]["right"]["numtimesrot90clockwise"],
+        )
+
+        # Append values
+        self.val_step_denorm_outputs.append(output_denorm)
+        self.val_step_gt.append(j3d_image)
 
         # 3D Loses
         loss_3d_pos = losses.loss_mpjpe(output, target3d)
@@ -552,7 +608,30 @@ class MotionBertSportPose(pl.LightningModule):
                     },
                 )
 
-        return loss_total
+        return j3d_image, output_denorm
+
+    def on_validation_epoch_end(self) -> None:
+        val_preds = torch.cat(self.val_step_denorm_outputs)
+        gt = torch.cat(self.val_step_gt)
+
+        # Align by root joint
+        val_preds = val_preds - val_preds[:, :, 0:1, :]
+        gt = gt - gt[:, :, 0:1, :]
+
+        val_preds = val_preds.cpu().numpy()
+        gt = gt.cpu().numpy()
+
+        # Calculate MPJPE and Procrustes aligned MPJPE
+        mpjpe = losses.mpjpe(val_preds, gt)
+        pampjpe = losses.p_mpjpe(val_preds, gt)
+
+        # Log MPJPE and PAMPJPE
+        self.log("val/mpjpe", mpjpe)
+        self.log("val/pampjpe", pampjpe)
+
+        # Clear variables
+        self.val_step_denorm_outputs.clear()
+        self.val_step_gt.clear()
 
     def test_step(self, batch, batch_idx):
         # Get camera and 3d pose in world coordinate
@@ -727,25 +806,25 @@ def main():
 
     train_loader = utils.data.DataLoader(
         train_dataset,
-        batch_size=6,
+        batch_size=8,
         shuffle=True,
-        num_workers=6,
+        num_workers=8,
         persistent_workers=True,
         pin_memory=True,
     )
     val_loader = utils.data.DataLoader(
         val_dataset,
-        batch_size=6,
+        batch_size=8,
         shuffle=False,
-        num_workers=6,
+        num_workers=8,
         persistent_workers=True,
         pin_memory=True,
     )
     test_loader = utils.data.DataLoader(
         test_dataset,
-        batch_size=6,
+        batch_size=8,
         shuffle=False,
-        num_workers=6,
+        num_workers=8,
         persistent_workers=True,
         pin_memory=True,
     )
