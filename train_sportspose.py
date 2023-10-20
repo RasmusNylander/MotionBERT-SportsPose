@@ -466,9 +466,11 @@ class MotionBertSportPose(pl.LightningModule):
 
         self.debug_images = debug_images
 
-        # Init vars for validation metric calculation
+        # Init vars for validation and test metric calculation
         self.val_step_denorm_outputs = []
         self.val_step_gt = []
+        self.test_step_denorm_outputs = []
+        self.test_step_gt = []
 
     def training_step(self, batch, batch_idx):
         # Get camera and 3d pose in world coordinate
@@ -635,22 +637,31 @@ class MotionBertSportPose(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         # Get camera and 3d pose in world coordinate
-        target3d = sportspose2h36m(
+        target3d, j3d_cam, j3d_image = sportspose2h36m(
             batch["joints_3d"]["data_points"],
             batch["video"]["calibration"]["right"],
             batch["video"]["right"]["numtimesrot90clockwise"],
             batch["video"]["right"]["img_dims"],
+            return_camera_and_image_coordinates=True,
         )
 
         # Ortho project 3D pose to 2D pose for 2D gt - set z to 1 as being confidence in 2D
         pose2d = target3d.clone()
         pose2d[..., 2] = 1.0
 
-        # Augment / Mask 2D poses
-        # TODO: Add augmentation and masking
-
         # Get 3D pose from model
         output = self.model(pose2d)
+
+        # Get denormalized values for MPJPE
+        output_denorm = denormalize_dections(
+            output,
+            batch["video"]["right"]["img_dims"],
+            batch["video"]["right"]["numtimesrot90clockwise"],
+        )
+
+        # Append values
+        self.test_step_denorm_outputs.append(output_denorm)
+        self.test_step_gt.append(j3d_image)
 
         # 3D Loses
         loss_3d_pos = losses.loss_mpjpe(output, target3d)
@@ -697,6 +708,29 @@ class MotionBertSportPose(pl.LightningModule):
                 )
 
         return loss_total
+
+    def on_test_epoch_end(self) -> None:
+        test_preds = torch.cat(self.test_step_denorm_outputs)
+        gt = torch.cat(self.test_step_gt)
+
+        # Align by root joint
+        test_preds = test_preds - test_preds[:, :, 0:1, :]
+        gt = gt - gt[:, :, 0:1, :]
+
+        test_preds = test_preds.cpu().numpy()
+        gt = gt.cpu().numpy()
+
+        # Calculate MPJPE and Procrustes aligned MPJPE
+        mpjpe = losses.mpjpe(test_preds, gt)
+        pampjpe = losses.p_mpjpe(test_preds, gt)
+
+        # Log MPJPE and PAMPJPE
+        self.log("test/mpjpe", mpjpe)
+        self.log("test/pampjpe", pampjpe)
+
+        # Clear variables
+        self.test_step_denorm_outputs.clear()
+        self.test_step_gt.clear()
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -846,6 +880,15 @@ def main():
     trainer = pl.Trainer(
         max_epochs=30, logger=wandb_logger, default_root_dir=checkpoint_dir
     )
+
+    # Test baseline model
+    trainer.test(
+        dataloaders=test_loader,
+        verbose=True,
+        model=motionbert,
+    )
+
+    # Train model
     trainer.fit(
         model=motionbert,
         train_dataloaders=train_loader,
