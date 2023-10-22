@@ -1,7 +1,6 @@
 import torch
 from torch import nn, optim, utils
 from typing import Any
-from sportspose.dataset import SportsPoseDataset
 import lightning.pytorch as pl
 from lib.model.DSTformer import DSTformer
 import lib.model.loss as losses
@@ -13,6 +12,8 @@ import tqdm
 import wandb
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+import os
+from trackman.posetools.data.datasets import AbstractImageDataset
 
 
 def get_wandb_video_from_joints(joints, fps=30):
@@ -432,6 +433,7 @@ class MotionBertSportPose(pl.LightningModule):
         config=None,
         ortho_project=False,
         pretrain_path=None,
+        view="FO",
     ) -> None:
         super().__init__()
 
@@ -466,6 +468,8 @@ class MotionBertSportPose(pl.LightningModule):
 
         self.debug_images = debug_images
 
+        self.view = view
+
         # Init vars for validation and test metric calculation
         self.val_step_denorm_outputs = []
         self.val_step_gt = []
@@ -476,9 +480,9 @@ class MotionBertSportPose(pl.LightningModule):
         # Get camera and 3d pose in world coordinate
         target3d, j3d_cam, j3d_image = sportspose2h36m(
             batch["joints_3d"]["data_points"],
-            batch["video"]["calibration"]["right"],
-            batch["video"]["right"]["numtimesrot90clockwise"],
-            batch["video"]["right"]["img_dims"],
+            batch["video"]["calibration"][self.view],
+            batch["video"][self.view]["numtimesrot90clockwise"],
+            batch["video"][self.view]["img_dims"],
             return_camera_and_image_coordinates=True,
         )
 
@@ -542,9 +546,9 @@ class MotionBertSportPose(pl.LightningModule):
         # Get camera and 3d pose in world coordinate
         target3d, j3d_cam, j3d_image = sportspose2h36m(
             batch["joints_3d"]["data_points"],
-            batch["video"]["calibration"]["right"],
-            batch["video"]["right"]["numtimesrot90clockwise"],
-            batch["video"]["right"]["img_dims"],
+            batch["video"]["calibration"][self.view],
+            batch["video"][self.view]["numtimesrot90clockwise"],
+            batch["video"][self.view]["img_dims"],
             return_camera_and_image_coordinates=True,
         )
 
@@ -558,8 +562,8 @@ class MotionBertSportPose(pl.LightningModule):
         # Get denormalized values for MPJPE
         output_denorm = denormalize_dections(
             output,
-            batch["video"]["right"]["img_dims"],
-            batch["video"]["right"]["numtimesrot90clockwise"],
+            batch["video"][self.view]["img_dims"],
+            batch["video"][self.view]["numtimesrot90clockwise"],
         )
 
         # Append values
@@ -639,9 +643,9 @@ class MotionBertSportPose(pl.LightningModule):
         # Get camera and 3d pose in world coordinate
         target3d, j3d_cam, j3d_image = sportspose2h36m(
             batch["joints_3d"]["data_points"],
-            batch["video"]["calibration"]["right"],
-            batch["video"]["right"]["numtimesrot90clockwise"],
-            batch["video"]["right"]["img_dims"],
+            batch["video"]["calibration"][self.view],
+            batch["video"][self.view]["numtimesrot90clockwise"],
+            batch["video"][self.view]["img_dims"],
             return_camera_and_image_coordinates=True,
         )
 
@@ -655,8 +659,8 @@ class MotionBertSportPose(pl.LightningModule):
         # Get denormalized values for MPJPE
         output_denorm = denormalize_dections(
             output,
-            batch["video"]["right"]["img_dims"],
-            batch["video"]["right"]["numtimesrot90clockwise"],
+            batch["video"][self.view]["img_dims"],
+            batch["video"][self.view]["numtimesrot90clockwise"],
         )
 
         # Append values
@@ -741,18 +745,23 @@ def main():
     torch.set_float32_matmul_precision("medium")
 
     # Init train dataset
-    datapath = "/work3/ckin/datasets/SportsPose/SportsPose"
+    root_datapath = "/work3/ckin/bigdata/SportsPose/"
+    data_path = os.path.join(root_datapath, "MarkerlessEndBachelor_withVideoPaths")
+    video_path = os.path.join(root_datapath, "videos")
     include_debug_images = False
 
     # Init log and checkpoint data dir
     checkpoint_dir = "/work3/ckin/motionbert_data"
 
     print("Loading dataset...")
-    test_subjects = ["S12", "S06", "S19"]
-    val_subjects = ["S04", "S14", "S22", "S07", "S09"]
+    test_subjects = ["mje", "mzm", "shs"]
+    val_subjects = ["orb", "mhp", "mhs", "cin", "ufh"]
 
-    train_dataset = SportsPoseDataset(
-        data_dir=datapath,
+    train_dataset = AbstractImageDataset(
+        data_dir=data_path,
+        dataset_type="sportsPose",
+        video_root_dir=video_path,
+        views=["FO"],
         sample_level="video",
         return_preset={
             "joints_2d": True,
@@ -778,8 +787,11 @@ def main():
     )
 
     # Val
-    val_dataset = SportsPoseDataset(
-        data_dir=datapath,
+    val_dataset = AbstractImageDataset(
+        data_dir=data_path,
+        dataset_type="sportsPose",
+        video_root_dir=video_path,
+        views=["FO"],
         sample_level="video",
         return_preset={
             "joints_2d": True,
@@ -806,8 +818,11 @@ def main():
     )
 
     # Test
-    test_dataset = SportsPoseDataset(
-        data_dir=datapath,
+    test_dataset = AbstractImageDataset(
+        data_dir=data_path,
+        dataset_type="sportsPose",
+        video_root_dir=video_path,
+        views=["FO"],
         sample_level="video",
         return_preset={
             "joints_2d": True,
