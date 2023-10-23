@@ -511,7 +511,10 @@ class MotionBertSportPose(pl.LightningModule):
             outputs.append(output)
 
         # Consistency loss
-        loss_consistency = losses.loss_consistency(*outputs)
+        if len(outputs) > 1:
+            loss_consistency = losses.loss_consistency(*outputs)
+        else:
+            loss_consistency = torch.tensor(0.0).to(outputs[0])
 
         # Recombine values for easier loss calculation
         output = torch.cat(outputs, dim=0)
@@ -613,7 +616,10 @@ class MotionBertSportPose(pl.LightningModule):
             output_denorms.append(output_denorm)
 
         # Consistency loss
-        loss_consistency = losses.loss_consistency(*outputs)
+        if len(outputs) > 1:
+            loss_consistency = losses.loss_consistency(*outputs)
+        else:
+            loss_consistency = torch.tensor(0.0).to(outputs[0])
 
         # Recombine values for easier loss calculation
         output = torch.cat(outputs, dim=0)
@@ -739,7 +745,10 @@ class MotionBertSportPose(pl.LightningModule):
             output_denorms.append(output_denorm)
 
         # Consistency loss
-        loss_consistency = losses.loss_consistency(*outputs)
+        if len(outputs) > 1:
+            loss_consistency = losses.loss_consistency(*outputs)
+        else:
+            loss_consistency = torch.tensor(0.0).to(outputs[0])
 
         # Recombine values for easier loss calculation
         output = torch.cat(outputs, dim=0)
@@ -840,11 +849,7 @@ def main():
     views = ["FO", "DL"]
 
     # Set batch size
-    batch_size = 4
-
-    assert (
-        batch_size % len(views) == 0
-    ), "Batch size must be divisible by number of views"
+    batch_size = 6
 
     # Init log and checkpoint data dir
     checkpoint_dir = "/work3/ckin/motionbert_data"
@@ -991,7 +996,10 @@ def main():
     # Init trainer
     print("Start training...")
     trainer = pl.Trainer(
-        max_epochs=30, logger=wandb_logger, default_root_dir=checkpoint_dir
+        max_epochs=30,
+        logger=wandb_logger,
+        default_root_dir=checkpoint_dir,
+        check_val_every_n_epoch=10,
     )
 
     # Test baseline model
