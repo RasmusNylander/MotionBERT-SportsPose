@@ -284,37 +284,52 @@ def loss_consistency(v1, v2):
     for view1, view2 in zip(v1, v2):
         # view1 = predicted
         # view2 = target
-        muX = torch.mean(view1, axis=1, keepdims=True)
-        muY = torch.mean(view2, axis=1, keepdims=True)
 
-        X0 = view2 - muX
-        Y0 = view1 - muY
+        # Unroll sequence
+        view1_unroll = view1.reshape(-1, 3)
+        view2_unroll = view2.reshape(-1, 3)
 
-        normX = torch.sqrt(torch.sum(X0**2, dim=(1, 2), keepdims=True))
-        normY = torch.sqrt(torch.sum(Y0**2, dim=(1, 2), keepdims=True))
+        # Compute rigid transformation based on entire sequence
+        c, R, t = rigid_transform_3D(view1_unroll, view2_unroll)
 
-        X0 /= normX
-        Y0 /= normY
-
-        H = torch.matmul(X0.permute(0, 2, 1), Y0)
-        U, s, Vt = torch.linalg.svd(H)
-        V = Vt.permute(0, 2, 1)
-        R = torch.matmul(V, U.permute(0, 2, 1))
-
-        # Avoid improper rotations (reflections), i.e. rotations with det(R) = -1
-        sign_detR = torch.sign(torch.unsqueeze(torch.linalg.det(R), 1))
-        V[:, :, -1] *= sign_detR
-        s[:, -1] *= sign_detR.flatten()
-        R = torch.matmul(V, U.permute(0, 2, 1))  # Rotation
-        tr = torch.unsqueeze(torch.sum(s, dim=1, keepdims=True), 2)
-        a = tr * normX / normY  # Scale
-        t = muX - a * torch.matmul(muY, R)  # Translation
-        # Perform rigid transformation on the input
-        predicted_aligned = a * torch.matmul(view1, R) + t
+        # Apply rigid transformation to entire sequence
+        view1_unroll_aligned = torch.mm(view1_unroll, R.t()) * c + t[:, 0]
 
         # Compute MPJPE
         view_mpjpe.append(
-            torch.mean(torch.norm(predicted_aligned - view2, dim=len(view2.shape) - 1))
+            torch.mean(
+                torch.norm(view1_unroll_aligned - view2_unroll, dim=1), dim=0
+            ).item()
         )
 
     return torch.mean(torch.as_tensor(view_mpjpe))
+
+
+def rigid_align(A, B):
+    c, R, t = rigid_transform_3D(A, B)
+    A = torch.tensor(A)  # Convert A to a PyTorch tensor
+    A2 = torch.mm(c * R, A.t()) + t
+    A2 = A2.t().numpy()  # Convert A2 back to a NumPy array if needed
+    return A2
+
+
+def rigid_transform_3D(A, B):
+    """
+    Compute rigid transformation from A to B by Procrustes analysis.
+    """
+    n, dim = A.shape
+    centroid_A = torch.mean(A, dim=0)
+    centroid_B = torch.mean(B, dim=0)
+    H = torch.mm((A - centroid_A).t(), B - centroid_B) / n
+    U, s, V = torch.svd(H)
+    R = torch.mm(V, U.t())
+    if torch.det(R) < 0:
+        s[-1] = -s[-1]
+        V[:, 2] = -V[:, 2]
+        R = torch.mm(V, U.t())
+
+    varP = torch.var(A, dim=0).sum()
+    c = 1 / varP * s.sum()
+
+    t = -torch.mm(c * R, centroid_A.view(3, 1)) + centroid_B.view(3, 1)
+    return c, R, t
