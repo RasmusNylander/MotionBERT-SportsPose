@@ -271,3 +271,50 @@ def loss_angle_velocity(x, gt):
     x_av = x_a[:, 1:] - x_a[:, :-1]
     gt_av = gt_a[:, 1:] - gt_a[:, :-1]
     return nn.L1Loss()(x_av, gt_av)
+
+
+def loss_consistency(v1, v2):
+    """
+    Loss penaæizes if too pose sequences from different views are'nt equal under a rigid transformation.
+    """
+    assert v1.shape == v2.shape
+
+    view_mpjpe = []
+    # Compute rigid transformation
+    for view1, view2 in zip(v1, v2):
+        # view1 = predicted
+        # view2 = target
+        muX = torch.mean(view1, axis=1, keepdims=True)
+        muY = torch.mean(view2, axis=1, keepdims=True)
+
+        X0 = view2 - muX
+        Y0 = view1 - muY
+
+        normX = torch.sqrt(torch.sum(X0**2, dim=(1, 2), keepdims=True))
+        normY = torch.sqrt(torch.sum(Y0**2, dim=(1, 2), keepdims=True))
+
+        X0 /= normX
+        Y0 /= normY
+
+        H = torch.matmul(X0.permute(0, 2, 1), Y0)
+        U, s, Vt = torch.linalg.svd(H)
+        V = Vt.permute(0, 2, 1)
+        R = torch.matmul(V, U.permute(0, 2, 1))
+
+        # Avoid improper rotations (reflections), i.e. rotations with det(R) = -1
+        sign_detR = torch.sign(torch.unsqueeze(torch.linalg.det(R), 1))
+        V[:, :, -1] *= sign_detR
+        s[:, -1] *= sign_detR.flatten()
+        R = torch.matmul(V, U.permute(0, 2, 1))  # Rotation
+        tr = torch.unsqueeze(torch.sum(s, dim=1, keepdims=True), 2)
+        a = tr * normX / normY  # Scale
+        t = muX - a * torch.matmul(muY, R)  # Translation
+        # Perform rigid transformation on the input
+        predicted_aligned = a * torch.matmul(view1, R) + t
+
+        # Compute MPJPE
+        view_mpjpe.append(
+            torch.mean(torch.norm(predicted_aligned - view2, dim=len(view2.shape) - 1))
+        )
+
+    return torch.mean(torch.as_tensor(view_mpjpe))

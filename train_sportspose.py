@@ -423,23 +423,27 @@ class TrainingConfig:
     lambda_lg: float = 1.0
     lambda_a: float = 1.0
     lambda_av: float = 1.0
+    lambda_consistency: float = 1.0
 
 
 class MotionBertSportPose(pl.LightningModule):
     def __init__(
         self,
         learning_rate,
+        views,
+        batch_size,
         debug_images=False,
         config=None,
         ortho_project=False,
         pretrain_path=None,
-        view="FO",
     ) -> None:
         super().__init__()
 
         self.save_hyperparameters()
 
         self.learning_rate = learning_rate
+        self.views = views
+        self.batch_size = batch_size
 
         self.model = DSTformer(
             dim_in=3,
@@ -468,8 +472,6 @@ class MotionBertSportPose(pl.LightningModule):
 
         self.debug_images = debug_images
 
-        self.view = view
-
         # Init vars for validation and test metric calculation
         self.val_step_denorm_outputs = []
         self.val_step_gt = []
@@ -478,23 +480,45 @@ class MotionBertSportPose(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         # Get camera and 3d pose in world coordinate
-        target3d, j3d_cam, j3d_image = sportspose2h36m(
-            batch["joints_3d"]["data_points"],
-            batch["video"]["calibration"][self.view],
-            batch["video"][self.view]["numtimesrot90clockwise"],
-            batch["video"][self.view]["img_dims"],
-            return_camera_and_image_coordinates=True,
-        )
+        target3ds = []
+        j3d_cams = []
+        j3d_images = []
+        pose2ds = []
+        outputs = []
+        for view in self.views:
+            target3d, j3d_cam, j3d_image = sportspose2h36m(
+                batch["joints_3d"]["data_points"],
+                batch["video"]["calibration"][view],
+                batch["video"][view]["numtimesrot90clockwise"],
+                batch["video"][view]["img_dims"],
+                return_camera_and_image_coordinates=True,
+            )
+            target3ds.append(target3d)
+            j3d_cams.append(j3d_cam)
+            j3d_images.append(j3d_image)
 
-        # Ortho project 3D pose to 2D pose for 2D gt - set z to 1 as being confidence in 2D
-        pose2d = target3d.clone()
-        pose2d[..., 2] = 1.0
+            # Ortho project 3D pose to 2D pose for 2D gt - set z to 1 as being confidence in 2D
+            pose2d = target3d.clone()
+            pose2d[..., 2] = 1.0
 
-        # Augment / Mask 2D poses
-        # TODO: Add augmentation and masking
+            pose2ds.append(pose2d)
 
-        # Get 3D pose from model
-        output = self.model(pose2d)
+            # Augment / Mask 2D poses
+            # TODO: Add augmentation and masking
+
+            # Get 3D pose from model
+            output = self.model(pose2d)
+            outputs.append(output)
+
+        # Consistency loss
+        loss_consistency = losses.loss_consistency(*outputs)
+
+        # Recombine values for easier loss calculation
+        output = torch.cat(outputs, dim=0)
+        target3d = torch.cat(target3ds, dim=0)
+        j3d_cam = torch.cat(j3d_cams, dim=0)
+        j3d_image = torch.cat(j3d_images, dim=0)
+        pose2d = torch.cat(pose2ds, dim=0)
 
         # 3D Loses
         loss_3d_pos = losses.loss_mpjpe(output, target3d)
@@ -515,7 +539,10 @@ class MotionBertSportPose(pl.LightningModule):
             + self.config.lambda_lg * loss_limb_gt
             + self.config.lambda_a * loss_angle
         )
-        +self.config.lambda_av * loss_angle_velocity
+        (
+            +self.config.lambda_av * loss_angle_velocity
+            + self.config.lambda_consistency * loss_consistency
+        )
 
         # Log 3D losses
         self.log("train/loss_3d_pos", loss_3d_pos, on_epoch=True)
@@ -526,6 +553,7 @@ class MotionBertSportPose(pl.LightningModule):
         self.log("train/loss_angle", loss_angle, on_epoch=True)
         self.log("train/loss_angle_velocity", loss_angle_velocity, on_epoch=True)
         self.log("train/loss_total", loss_total, on_epoch=True)
+        self.log("train/loss_consistency", loss_consistency, on_epoch=True)
 
         if self.trainer.is_last_batch:
             # Log sample of one of the predicted 3D poses from the trainset
@@ -544,31 +572,56 @@ class MotionBertSportPose(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         # Get camera and 3d pose in world coordinate
-        target3d, j3d_cam, j3d_image = sportspose2h36m(
-            batch["joints_3d"]["data_points"],
-            batch["video"]["calibration"][self.view],
-            batch["video"][self.view]["numtimesrot90clockwise"],
-            batch["video"][self.view]["img_dims"],
-            return_camera_and_image_coordinates=True,
-        )
+        target3ds = []
+        j3d_cams = []
+        j3d_images = []
+        pose2ds = []
+        outputs = []
+        output_denorms = []
+        for view in self.views:
+            target3d, j3d_cam, j3d_image = sportspose2h36m(
+                batch["joints_3d"]["data_points"],
+                batch["video"]["calibration"][view],
+                batch["video"][view]["numtimesrot90clockwise"],
+                batch["video"][view]["img_dims"],
+                return_camera_and_image_coordinates=True,
+            )
 
-        # Ortho project 3D pose to 2D pose for 2D gt - set z to 1 as being confidence in 2D
-        pose2d = target3d.clone()
-        pose2d[..., 2] = 1.0
+            # Ortho project 3D pose to 2D pose for 2D gt - set z to 1 as being confidence in 2D
+            pose2d = target3d.clone()
+            pose2d[..., 2] = 1.0
 
-        # Get 3D pose from model
-        output = self.model(pose2d)
+            # Get 3D pose from model
+            output = self.model(pose2d)
 
-        # Get denormalized values for MPJPE
-        output_denorm = denormalize_dections(
-            output,
-            batch["video"][self.view]["img_dims"],
-            batch["video"][self.view]["numtimesrot90clockwise"],
-        )
+            # Get denormalized values for MPJPE
+            output_denorm = denormalize_dections(
+                output,
+                batch["video"][view]["img_dims"],
+                batch["video"][view]["numtimesrot90clockwise"],
+            )
 
-        # Append values
-        self.val_step_denorm_outputs.append(output_denorm)
-        self.val_step_gt.append(j3d_image)
+            # Append values
+            self.val_step_denorm_outputs.append(output_denorm)
+            self.val_step_gt.append(j3d_image)
+
+            target3ds.append(target3d)
+            j3d_cams.append(j3d_cam)
+            j3d_images.append(j3d_image)
+            pose2ds.append(pose2d)
+            outputs.append(output)
+            output_denorms.append(output_denorm)
+
+        # Consistency loss
+        loss_consistency = losses.loss_consistency(*outputs)
+
+        # Recombine values for easier loss calculation
+        output = torch.cat(outputs, dim=0)
+        output_denorm = torch.cat(output_denorms, dim=0)
+        target3d = torch.cat(target3ds, dim=0)
+        j3d_cam = torch.cat(j3d_cams, dim=0)
+        j3d_image = torch.cat(j3d_images, dim=0)
+        pose2d = torch.cat(pose2ds, dim=0)
 
         # 3D Loses
         loss_3d_pos = losses.loss_mpjpe(output, target3d)
@@ -589,7 +642,10 @@ class MotionBertSportPose(pl.LightningModule):
             + self.config.lambda_lg * loss_limb_gt
             + self.config.lambda_a * loss_angle
         )
-        +self.config.lambda_av * loss_angle_velocity
+        (
+            +self.config.lambda_av * loss_angle_velocity
+            + self.config.lambda_consistency * loss_consistency
+        )
 
         # Log 3D losses
         self.log("val/loss_3d_pos", loss_3d_pos, on_epoch=True)
@@ -600,6 +656,7 @@ class MotionBertSportPose(pl.LightningModule):
         self.log("val/loss_angle", loss_angle, on_epoch=True)
         self.log("val/loss_angle_velocity", loss_angle_velocity, on_epoch=True)
         self.log("val/loss_total", loss_total, on_epoch=True)
+        self.log("val/loss_consistency", loss_consistency, on_epoch=True)
 
         if self.trainer.is_last_batch:
             # Log sample of one of the predicted 3D poses from the trainset
@@ -641,31 +698,56 @@ class MotionBertSportPose(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         # Get camera and 3d pose in world coordinate
-        target3d, j3d_cam, j3d_image = sportspose2h36m(
-            batch["joints_3d"]["data_points"],
-            batch["video"]["calibration"][self.view],
-            batch["video"][self.view]["numtimesrot90clockwise"],
-            batch["video"][self.view]["img_dims"],
-            return_camera_and_image_coordinates=True,
-        )
+        target3ds = []
+        j3d_cams = []
+        j3d_images = []
+        pose2ds = []
+        outputs = []
+        output_denorms = []
+        for view in self.views:
+            target3d, j3d_cam, j3d_image = sportspose2h36m(
+                batch["joints_3d"]["data_points"],
+                batch["video"]["calibration"][view],
+                batch["video"][view]["numtimesrot90clockwise"],
+                batch["video"][view]["img_dims"],
+                return_camera_and_image_coordinates=True,
+            )
 
-        # Ortho project 3D pose to 2D pose for 2D gt - set z to 1 as being confidence in 2D
-        pose2d = target3d.clone()
-        pose2d[..., 2] = 1.0
+            # Ortho project 3D pose to 2D pose for 2D gt - set z to 1 as being confidence in 2D
+            pose2d = target3d.clone()
+            pose2d[..., 2] = 1.0
 
-        # Get 3D pose from model
-        output = self.model(pose2d)
+            # Get 3D pose from model
+            output = self.model(pose2d)
 
-        # Get denormalized values for MPJPE
-        output_denorm = denormalize_dections(
-            output,
-            batch["video"][self.view]["img_dims"],
-            batch["video"][self.view]["numtimesrot90clockwise"],
-        )
+            # Get denormalized values for MPJPE
+            output_denorm = denormalize_dections(
+                output,
+                batch["video"][view]["img_dims"],
+                batch["video"][view]["numtimesrot90clockwise"],
+            )
 
-        # Append values
-        self.test_step_denorm_outputs.append(output_denorm)
-        self.test_step_gt.append(j3d_image)
+            # Append values
+            self.test_step_denorm_outputs.append(output_denorm)
+            self.test_step_gt.append(j3d_image)
+
+            target3ds.append(target3d)
+            j3d_cams.append(j3d_cam)
+            j3d_images.append(j3d_image)
+            pose2ds.append(pose2d)
+            outputs.append(output)
+            output_denorms.append(output_denorm)
+
+        # Consistency loss
+        loss_consistency = losses.loss_consistency(*outputs)
+
+        # Recombine values for easier loss calculation
+        output = torch.cat(outputs, dim=0)
+        output_denorm = torch.cat(output_denorms, dim=0)
+        target3d = torch.cat(target3ds, dim=0)
+        j3d_cam = torch.cat(j3d_cams, dim=0)
+        j3d_image = torch.cat(j3d_images, dim=0)
+        pose2d = torch.cat(pose2ds, dim=0)
 
         # 3D Loses
         loss_3d_pos = losses.loss_mpjpe(output, target3d)
@@ -686,7 +768,10 @@ class MotionBertSportPose(pl.LightningModule):
             + self.config.lambda_lg * loss_limb_gt
             + self.config.lambda_a * loss_angle
         )
-        +self.config.lambda_av * loss_angle_velocity
+        (
+            +self.config.lambda_av * loss_angle_velocity
+            + self.config.lambda_consistency * loss_consistency
+        )
 
         # Log 3D losses
         self.log("test/loss_3d_pos", loss_3d_pos, on_epoch=True)
@@ -697,6 +782,7 @@ class MotionBertSportPose(pl.LightningModule):
         self.log("test/loss_angle", loss_angle, on_epoch=True)
         self.log("test/loss_angle_velocity", loss_angle_velocity, on_epoch=True)
         self.log("test/loss_total", loss_total, on_epoch=True)
+        self.log("test/loss_consistency", loss_consistency, on_epoch=True)
 
         if self.trainer.is_last_batch:
             # Log sample of one of the predicted 3D poses from the trainset
@@ -750,6 +836,16 @@ def main():
     video_path = os.path.join(root_datapath, "videos")
     include_debug_images = False
 
+    # Set views
+    views = ["FO", "DL"]
+
+    # Set batch size
+    batch_size = 4
+
+    assert (
+        batch_size % len(views) == 0
+    ), "Batch size must be divisible by number of views"
+
     # Init log and checkpoint data dir
     checkpoint_dir = "/work3/ckin/motionbert_data"
 
@@ -761,7 +857,7 @@ def main():
         data_dir=data_path,
         dataset_type="sportsPose",
         video_root_dir=video_path,
-        views=["FO"],
+        views=views,
         sample_level="video",
         return_preset={
             "joints_2d": True,
@@ -791,7 +887,7 @@ def main():
         data_dir=data_path,
         dataset_type="sportsPose",
         video_root_dir=video_path,
-        views=["FO"],
+        views=views,
         sample_level="video",
         return_preset={
             "joints_2d": True,
@@ -822,7 +918,7 @@ def main():
         data_dir=data_path,
         dataset_type="sportsPose",
         video_root_dir=video_path,
-        views=["FO"],
+        views=views,
         sample_level="video",
         return_preset={
             "joints_2d": True,
@@ -855,25 +951,25 @@ def main():
 
     train_loader = utils.data.DataLoader(
         train_dataset,
-        batch_size=8,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=8,
+        num_workers=batch_size,
         persistent_workers=True,
         pin_memory=True,
     )
     val_loader = utils.data.DataLoader(
         val_dataset,
-        batch_size=8,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=8,
+        num_workers=batch_size,
         persistent_workers=True,
         pin_memory=True,
     )
     test_loader = utils.data.DataLoader(
         test_dataset,
-        batch_size=8,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=8,
+        num_workers=batch_size,
         persistent_workers=True,
         pin_memory=True,
     )
@@ -883,6 +979,8 @@ def main():
         learning_rate=0.0002,
         debug_images=include_debug_images,
         pretrain_path="/zhome/0c/6/109332/Projects/MotionBERT/models/model.bin",
+        views=views,
+        batch_size=batch_size,
     )
 
     # Init wandb logging
@@ -917,3 +1015,6 @@ def main():
 if __name__ == "__main__":
     print("Hello from main")
     main()
+
+# TODO: Check if the consistency loss is correct with the current implementation
+# TODO: Check if the frames are identical or we need to do something with the order. Discuss with RATI
