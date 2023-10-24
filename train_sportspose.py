@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import os
 from trackman.posetools.data.datasets import AbstractImageDataset
+from lightning.pytorch.cli import LightningCLI
 
 
 def get_wandb_video_from_joints(joints, fps=30):
@@ -431,11 +432,19 @@ class MotionBertSportPose(pl.LightningModule):
         self,
         learning_rate,
         views,
+        test_views,
         batch_size,
         debug_images=False,
         config=None,
         ortho_project=False,
         pretrain_path=None,
+        lambda_scale=1.0,
+        lambda_3d_velocity=1.0,
+        lambda_lv=1.0,
+        lambda_lg=1.0,
+        lambda_a=1.0,
+        lambda_av=1.0,
+        lambda_consistency=1.0,
     ) -> None:
         super().__init__()
 
@@ -443,7 +452,15 @@ class MotionBertSportPose(pl.LightningModule):
 
         self.learning_rate = learning_rate
         self.views = views
+        self.test_views = test_views
         self.batch_size = batch_size
+        self.lambda_scale = lambda_scale
+        self.lambda_3d_velocity = lambda_3d_velocity
+        self.lambda_lv = lambda_lv
+        self.lambda_lg = lambda_lg
+        self.lambda_a = lambda_a
+        self.lambda_av = lambda_av
+        self.lambda_consistency = lambda_consistency
 
         self.model = DSTformer(
             dim_in=3,
@@ -459,10 +476,15 @@ class MotionBertSportPose(pl.LightningModule):
         )
         self.ortho_project = ortho_project
 
-        if config is None:
-            self.config = TrainingConfig()
-        else:
-            self.config = config
+        self.config = TrainingConfig(
+            lambda_scale=self.lambda_scale,
+            lambda_3d_velocity=self.lambda_3d_velocity,
+            lambda_lv=self.lambda_lv,
+            lambda_lg=self.lambda_lg,
+            lambda_a=self.lambda_a,
+            lambda_av=self.lambda_av,
+            lambda_consistency=self.lambda_consistency,
+        )
 
         if pretrain_path is not None:
             self.model.load_state_dict(
@@ -581,7 +603,7 @@ class MotionBertSportPose(pl.LightningModule):
         pose2ds = []
         outputs = []
         output_denorms = []
-        for view in self.views:
+        for view in self.test_views:
             target3d, j3d_cam, j3d_image = sportspose2h36m(
                 batch["joints_3d"]["data_points"],
                 batch["video"]["calibration"][view],
@@ -710,7 +732,7 @@ class MotionBertSportPose(pl.LightningModule):
         pose2ds = []
         outputs = []
         output_denorms = []
-        for view in self.views:
+        for view in self.test_views:
             target3d, j3d_cam, j3d_image = sportspose2h36m(
                 batch["joints_3d"]["data_points"],
                 batch["video"]["calibration"][view],
@@ -836,193 +858,151 @@ class MotionBertSportPose(pl.LightningModule):
         return optimizer
 
 
+class SportsPoseDataModule(pl.LightningDataModule):
+    def __init__(
+        self, data_path, video_path, views, test_views, batch_size, include_debug_images
+    ):
+        super().__init__()
+        self.data_path = data_path
+        self.video_path = video_path
+        self.views = views
+        self.test_views = test_views
+        self.batch_size = batch_size
+        self.include_debug_images = include_debug_images
+
+        # Define data split
+        self.test_subjects = ["mje", "mzm", "shs"]
+        self.val_subjects = ["orb", "mhp", "mhs", "cin", "ufh"]
+
+        # Return preset
+        self.return_preset = {
+            "joints_2d": True,
+            "joints_3d": {
+                "data_points": True,
+            },
+            "metadata": {
+                "file_name": True,
+                "person_id": True,
+            },
+            "video": {
+                "view": {
+                    "camera": False,
+                    "img_dims": True,
+                    "numtimesrot90clockwise": True,
+                },
+                "image": self.include_debug_images,
+                "calibration": True,
+            },
+        }
+
+    def setup(self, stage=None):
+        self.train_dataset = AbstractImageDataset(
+            data_dir=self.data_path,
+            dataset_type="sportsPose",
+            video_root_dir=self.video_path,
+            views=self.views,
+            sample_level="video",
+            return_preset=self.return_preset,
+            blacklist={
+                "metadata": {"person_id": self.test_subjects + self.val_subjects}
+            },
+            seq_size=243,
+        )
+        self.val_dataset = AbstractImageDataset(
+            data_dir=self.data_path,
+            dataset_type="sportsPose",
+            video_root_dir=self.video_path,
+            views=self.test_views,
+            sample_level="video",
+            return_preset=self.return_preset,
+            whitelist={"metadata": {"person_id": self.val_subjects}},
+            seq_size=243,
+            validation_dataset=True,
+        )
+        self.test_dataset = AbstractImageDataset(
+            data_dir=self.data_path,
+            dataset_type="sportsPose",
+            video_root_dir=self.video_path,
+            views=self.test_views,
+            sample_level="video",
+            return_preset=self.return_preset,
+            whitelist={"metadata": {"person_id": self.test_subjects}},
+            seq_size=243,
+            validation_dataset=True,
+        )
+
+        print("Train dataset length: ", len(self.train_dataset))
+        print("Validation dataset length: ", len(self.val_dataset))
+        print("Test dataset length: ", len(self.test_dataset))
+
+    def train_dataloader(self):
+        return utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.batch_size,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+
+    def val_dataloader(self):
+        return utils.data.DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.batch_size,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+
+    def test_dataloader(self):
+        return utils.data.DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.batch_size,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+
+
+class CustomLightningCLI(LightningCLI):
+    def add_arguments_to_parser(self, parser):
+        parser.add_argument("--sweep", default=False)
+
+
 def main():
+    # Set precision for A100 efficiency
     torch.set_float32_matmul_precision("medium")
 
-    # Init train dataset
-    root_datapath = "/work3/ckin/bigdata/SportsPose/"
-    data_path = os.path.join(root_datapath, "MarkerlessEndBachelor_withVideoPaths")
-    video_path = os.path.join(root_datapath, "videos")
-    include_debug_images = False
-
-    # Set views
-    views = ["FO", "DL"]
-
-    # Set batch size
-    batch_size = 6
-
-    # Init log and checkpoint data dir
+    # Init logging
     checkpoint_dir = "/work3/ckin/motionbert_data"
-
-    print("Loading dataset...")
-    test_subjects = ["mje", "mzm", "shs"]
-    val_subjects = ["orb", "mhp", "mhs", "cin", "ufh"]
-
-    train_dataset = AbstractImageDataset(
-        data_dir=data_path,
-        dataset_type="sportsPose",
-        video_root_dir=video_path,
-        views=views,
-        sample_level="video",
-        return_preset={
-            "joints_2d": True,
-            "joints_3d": {
-                "data_points": True,
-            },
-            "metadata": {
-                "file_name": True,
-                "person_id": True,
-            },
-            "video": {
-                "view": {
-                    "camera": False,
-                    "img_dims": True,
-                    "numtimesrot90clockwise": True,
-                },
-                "image": include_debug_images,
-                "calibration": True,
-            },
-        },
-        blacklist={"metadata": {"person_id": test_subjects + val_subjects}},
-        seq_size=243,
-    )
-
-    # Val
-    val_dataset = AbstractImageDataset(
-        data_dir=data_path,
-        dataset_type="sportsPose",
-        video_root_dir=video_path,
-        views=views,
-        sample_level="video",
-        return_preset={
-            "joints_2d": True,
-            "joints_3d": {
-                "data_points": True,
-            },
-            "metadata": {
-                "file_name": True,
-                "person_id": True,
-            },
-            "video": {
-                "view": {
-                    "camera": False,
-                    "img_dims": True,
-                    "numtimesrot90clockwise": True,
-                },
-                "image": include_debug_images,
-                "calibration": True,
-            },
-        },
-        whitelist={"metadata": {"person_id": val_subjects}},
-        seq_size=243,
-        validation_dataset=True,
-    )
-
-    # Test
-    test_dataset = AbstractImageDataset(
-        data_dir=data_path,
-        dataset_type="sportsPose",
-        video_root_dir=video_path,
-        views=views,
-        sample_level="video",
-        return_preset={
-            "joints_2d": True,
-            "joints_3d": {
-                "data_points": True,
-            },
-            "metadata": {
-                "file_name": True,
-                "person_id": True,
-            },
-            "video": {
-                "view": {
-                    "camera": False,
-                    "img_dims": True,
-                    "numtimesrot90clockwise": True,
-                },
-                "image": include_debug_images,
-                "calibration": True,
-            },
-        },
-        whitelist={"metadata": {"person_id": test_subjects}},
-        seq_size=243,
-        validation_dataset=True,
-    )
-
-    print("Dataset loaded.")
-    print("Train dataset length: ", len(train_dataset))
-    print("Validation dataset length: ", len(val_dataset))
-    print("Test dataset length: ", len(test_dataset))
-
-    train_loader = utils.data.DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=batch_size,
-        persistent_workers=True,
-        pin_memory=True,
-    )
-    val_loader = utils.data.DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=batch_size,
-        persistent_workers=True,
-        pin_memory=True,
-    )
-    test_loader = utils.data.DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=batch_size,
-        persistent_workers=True,
-        pin_memory=True,
-    )
-
-    # Init model
-    motionbert = MotionBertSportPose(
-        learning_rate=0.0002,
-        debug_images=include_debug_images,
-        pretrain_path="/zhome/0c/6/109332/Projects/MotionBERT/models/model.bin",
-        views=views,
-        batch_size=batch_size,
-    )
-
-    # Init wandb logging
     wandb_logger = pl.loggers.WandbLogger(
         project="motionbert_sportspose", save_dir=checkpoint_dir
     )
 
-    # Init trainer
-    print("Start training...")
-    trainer = pl.Trainer(
-        max_epochs=30,
-        logger=wandb_logger,
-        default_root_dir=checkpoint_dir,
-        check_val_every_n_epoch=10,
+    # Init cli (Note that with the CLI we dont need a trainer module)
+    cli = CustomLightningCLI(
+        MotionBertSportPose,
+        SportsPoseDataModule,
+        seed_everything_default=42,
+        run=False,
+        trainer_defaults={"logger": wandb_logger, "default_root_dir": checkpoint_dir},
+        save_config_callback=None,
     )
 
-    # Test baseline model
-    trainer.test(
-        dataloaders=test_loader,
-        verbose=True,
-        model=motionbert,
-    )
+    wandb_logger.experiment.config.update(dict(cli.config.model))
 
-    # Train model
-    trainer.fit(
-        model=motionbert,
-        train_dataloaders=train_loader,
-        val_dataloaders=val_loader,
-    )
+    # Run test before training for baseline
+    cli.trainer.test(cli.model, datamodule=cli.datamodule, verbose=True)
 
-    # Test results
-    trainer.test(dataloaders=test_loader)
+    # Run training
+    cli.trainer.fit(cli.model, datamodule=cli.datamodule)
+
+    # Run test after training
+    cli.trainer.test(datamodule=cli.datamodule, verbose=True)
 
 
 if __name__ == "__main__":
     print("Hello from main")
     main()
-
-# TODO: Check if the consistency loss is correct with the current implementation
-# TODO: Check if the frames are identical or we need to do something with the order. Discuss with RATI

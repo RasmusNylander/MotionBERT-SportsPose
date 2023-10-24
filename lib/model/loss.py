@@ -275,7 +275,7 @@ def loss_angle_velocity(x, gt):
 
 def loss_consistency(v1, v2):
     """
-    Loss penaæizes if too pose sequences from different views are'nt equal under a rigid transformation.
+    Loss penalizes if two pose sequences from different views are'nt equal under a rigid transformation.
     """
     assert v1.shape == v2.shape
 
