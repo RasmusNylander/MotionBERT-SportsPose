@@ -445,6 +445,7 @@ class MotionBertSportPose(pl.LightningModule):
         lambda_a=1.0,
         lambda_av=1.0,
         lambda_consistency=1.0,
+        lambda_3d_pos=1.0,
     ) -> None:
         super().__init__()
 
@@ -461,6 +462,7 @@ class MotionBertSportPose(pl.LightningModule):
         self.lambda_a = lambda_a
         self.lambda_av = lambda_av
         self.lambda_consistency = lambda_consistency
+        self.lambda_3d_pos = lambda_3d_pos
 
         self.model = DSTformer(
             dim_in=3,
@@ -475,16 +477,6 @@ class MotionBertSportPose(pl.LightningModule):
             num_joints=17,
         )
         self.ortho_project = ortho_project
-
-        self.config = TrainingConfig(
-            lambda_scale=self.lambda_scale,
-            lambda_3d_velocity=self.lambda_3d_velocity,
-            lambda_lv=self.lambda_lv,
-            lambda_lg=self.lambda_lg,
-            lambda_a=self.lambda_a,
-            lambda_av=self.lambda_av,
-            lambda_consistency=self.lambda_consistency,
-        )
 
         if pretrain_path is not None:
             self.model.load_state_dict(
@@ -534,7 +526,7 @@ class MotionBertSportPose(pl.LightningModule):
 
         # Consistency loss
         if len(outputs) > 1:
-            loss_consistency = losses.loss_consistency(*outputs)
+            loss_consistency = losses.loss_consistency(outputs[0], outputs[1])
         else:
             loss_consistency = torch.tensor(0.0).to(outputs[0])
 
@@ -555,19 +547,39 @@ class MotionBertSportPose(pl.LightningModule):
         loss_angle_velocity = losses.loss_angle_velocity(output, target3d)
 
         loss_total = (
-            loss_3d_pos
-            + self.config.lambda_scale * loss_3d_scale
-            + self.config.lambda_3d_velocity * loss_3d_velocity
+            loss_3d_pos * self.lambda_3d_pos
+            + self.lambda_scale * loss_3d_scale
+            + self.lambda_3d_velocity * loss_3d_velocity
+            + self.lambda_lv * loss_limb_variation
+            + self.lambda_lg * loss_limb_gt
+            + self.lambda_a * loss_angle
+            + self.lambda_av * loss_angle_velocity
+            + self.lambda_consistency * loss_consistency
         )
-        (
-            +self.config.lambda_lv * loss_limb_variation
-            + self.config.lambda_lg * loss_limb_gt
-            + self.config.lambda_a * loss_angle
-        )
-        (
-            +self.config.lambda_av * loss_angle_velocity
-            + self.config.lambda_consistency * loss_consistency
-        )
+
+        if False:
+            print("Losses:")
+            print(loss_3d_pos)
+            print(self.config.lambda_scale * loss_3d_scale)
+            print(self.lambda_lv * loss_3d_velocity)
+            print(self.config.lambda_consistency * loss_consistency)
+
+            print("Total loss:")
+            print(
+                f"Sum of losses: {loss_3d_pos + self.config.lambda_scale * loss_3d_scale + self.config.lambda_3d_velocity * loss_3d_velocity + self.config.lambda_consistency * loss_consistency}"
+            )
+
+            print(f"Logged loss: {loss_total}")
+
+            print(
+                f"Whole computation: {loss_3d_pos + self.config.lambda_scale * loss_3d_scale + self.config.lambda_3d_velocity * loss_3d_velocity + self.config.lambda_lv * loss_limb_variation + self.config.lambda_lg * loss_limb_gt + self.config.lambda_a * loss_angle + self.config.lambda_av * loss_angle_velocity + self.config.lambda_consistency * loss_consistency}"
+            )
+
+            print(
+                f"Whole computation: {loss_3d_pos} + {self.config.lambda_scale * loss_3d_scale} + {self.config.lambda_3d_velocity} * {loss_3d_velocity} + {self.config.lambda_lv} * {loss_limb_variation} + {self.config.lambda_lg} * {loss_limb_gt} + {self.config.lambda_a} * {loss_angle} + {self.config.lambda_av} * {loss_angle_velocity} + {self.config.lambda_consistency} * {loss_consistency}"
+            )
+
+            print(loss_total)
 
         # Log 3D losses
         self.log("train/loss_3d_pos", loss_3d_pos, on_epoch=True)
@@ -580,18 +592,26 @@ class MotionBertSportPose(pl.LightningModule):
         self.log("train/loss_total", loss_total, on_epoch=True)
         self.log("train/loss_consistency", loss_consistency, on_epoch=True)
 
-        if self.trainer.is_last_batch:
-            # Log sample of one of the predicted 3D poses from the trainset
-            with torch.no_grad():
-                # Log pose sequence as gif
-                wandb_gif = get_wandb_video_from_joints(
-                    output[0, :, :, :].cpu().numpy()
-                )
-                self.logger.experiment.log(
-                    {
-                        "train/pose3d_pred_seq": wandb_gif,
-                    },
-                )
+        # Debug log consistency times weights
+        self.log(
+            "train/loss_consistency_times_weights",
+            loss_consistency * self.lambda_consistency,
+            on_epoch=True,
+        )
+
+        if False:
+            if self.trainer.is_last_batch:
+                # Log sample of one of the predicted 3D poses from the trainset
+                with torch.no_grad():
+                    # Log pose sequence as gif
+                    wandb_gif = get_wandb_video_from_joints(
+                        output[0, :, :, :].cpu().numpy()
+                    )
+                    self.logger.experiment.log(
+                        {
+                            "train/pose3d_pred_seq": wandb_gif,
+                        },
+                    )
 
         return loss_total
 
@@ -639,7 +659,7 @@ class MotionBertSportPose(pl.LightningModule):
 
         # Consistency loss
         if len(outputs) > 1:
-            loss_consistency = losses.loss_consistency(*outputs)
+            loss_consistency = losses.loss_consistency(outputs[0], outputs[1])
         else:
             loss_consistency = torch.tensor(0.0).to(outputs[0])
 
@@ -661,18 +681,14 @@ class MotionBertSportPose(pl.LightningModule):
         loss_angle_velocity = losses.loss_angle_velocity(output, target3d)
 
         loss_total = (
-            loss_3d_pos
-            + self.config.lambda_scale * loss_3d_scale
-            + self.config.lambda_3d_velocity * loss_3d_velocity
-        )
-        (
-            +self.config.lambda_lv * loss_limb_variation
-            + self.config.lambda_lg * loss_limb_gt
-            + self.config.lambda_a * loss_angle
-        )
-        (
-            +self.config.lambda_av * loss_angle_velocity
-            + self.config.lambda_consistency * loss_consistency
+            loss_3d_pos * self.lambda_3d_pos
+            + self.lambda_scale * loss_3d_scale
+            + self.lambda_3d_velocity * loss_3d_velocity
+            + self.lambda_lv * loss_limb_variation
+            + self.lambda_lg * loss_limb_gt
+            + self.lambda_a * loss_angle
+            + self.lambda_av * loss_angle_velocity
+            + self.lambda_consistency * loss_consistency
         )
 
         # Log 3D losses
@@ -790,18 +806,14 @@ class MotionBertSportPose(pl.LightningModule):
         loss_angle_velocity = losses.loss_angle_velocity(output, target3d)
 
         loss_total = (
-            loss_3d_pos
-            + self.config.lambda_scale * loss_3d_scale
-            + self.config.lambda_3d_velocity * loss_3d_velocity
-        )
-        (
-            +self.config.lambda_lv * loss_limb_variation
-            + self.config.lambda_lg * loss_limb_gt
-            + self.config.lambda_a * loss_angle
-        )
-        (
-            +self.config.lambda_av * loss_angle_velocity
-            + self.config.lambda_consistency * loss_consistency
+            loss_3d_pos * self.lambda_3d_pos
+            + self.lambda_scale * loss_3d_scale
+            + self.lambda_3d_velocity * loss_3d_velocity
+            + self.lambda_lv * loss_limb_variation
+            + self.lambda_lg * loss_limb_gt
+            + self.lambda_a * loss_angle
+            + self.lambda_av * loss_angle_velocity
+            + self.lambda_consistency * loss_consistency
         )
 
         # Log 3D losses
@@ -976,7 +988,7 @@ def main():
     torch.set_float32_matmul_precision("medium")
 
     # Init logging
-    checkpoint_dir = "/work3/ckin/motionbert_data"
+    checkpoint_dir = "/work3/ckin/motionbert_data/logs"
     wandb_logger = pl.loggers.WandbLogger(
         project="motionbert_sportspose", save_dir=checkpoint_dir
     )

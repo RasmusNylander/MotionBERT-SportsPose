@@ -309,7 +309,7 @@ def rigid_align(A, B):
     c, R, t = rigid_transform_3D(A, B)
     A = torch.tensor(A)  # Convert A to a PyTorch tensor
     A2 = torch.mm(c * R, A.t()) + t
-    A2 = A2.t().numpy()  # Convert A2 back to a NumPy array if needed
+    A2 = A2.t()
     return A2
 
 
