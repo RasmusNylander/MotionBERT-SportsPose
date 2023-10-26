@@ -279,9 +279,9 @@ def loss_consistency(v1, v2):
     """
     assert v1.shape == v2.shape
 
-    view_mpjpe = []
+    view_mpjpe = torch.empty(v1.shape[0])
     # Compute rigid transformation
-    for view1, view2 in zip(v1, v2):
+    for idx, (view1, view2) in enumerate(zip(v1, v2)):
         # view1 = predicted
         # view2 = target
 
@@ -296,21 +296,11 @@ def loss_consistency(v1, v2):
         view1_unroll_aligned = torch.mm(view1_unroll, R.t()) * c + t[:, 0]
 
         # Compute MPJPE
-        view_mpjpe.append(
-            torch.mean(
-                torch.norm(view1_unroll_aligned - view2_unroll, dim=1), dim=0
-            ).item()
+        view_mpjpe[idx] = torch.norm(view1_unroll_aligned - view2_unroll, dim=1).mean(
+            dim=0
         )
 
-    return torch.mean(torch.as_tensor(view_mpjpe))
-
-
-def rigid_align(A, B):
-    c, R, t = rigid_transform_3D(A, B)
-    A = torch.tensor(A)  # Convert A to a PyTorch tensor
-    A2 = torch.mm(c * R, A.t()) + t
-    A2 = A2.t()
-    return A2
+    return view_mpjpe.mean()
 
 
 def rigid_transform_3D(A, B):
@@ -333,3 +323,11 @@ def rigid_transform_3D(A, B):
 
     t = -torch.mm(c * R, centroid_A.view(3, 1)) + centroid_B.view(3, 1)
     return c, R, t
+
+
+def rigid_align(A, B):
+    c, R, t = rigid_transform_3D(A, B)
+    A = torch.tensor(A)  # Convert A to a PyTorch tensor
+    A2 = torch.mm(c * R, A.t()) + t
+    A2 = A2.t()
+    return A2
