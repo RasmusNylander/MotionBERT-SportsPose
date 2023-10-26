@@ -526,7 +526,7 @@ class MotionBertSportPose(pl.LightningModule):
 
         # Consistency loss
         if len(outputs) > 1:
-            loss_consistency = losses.loss_consistency(outputs[0], outputs[1])
+            loss_consistency = losses.loss_consistency(outputs[1], outputs[0])
         else:
             loss_consistency = torch.tensor(0.0).to(outputs[0])
 
@@ -659,7 +659,7 @@ class MotionBertSportPose(pl.LightningModule):
 
         # Consistency loss
         if len(outputs) > 1:
-            loss_consistency = losses.loss_consistency(outputs[0], outputs[1])
+            loss_consistency = losses.loss_consistency(outputs[1], outputs[0])
         else:
             loss_consistency = torch.tensor(0.0).to(outputs[0])
 
@@ -784,7 +784,7 @@ class MotionBertSportPose(pl.LightningModule):
 
         # Consistency loss
         if len(outputs) > 1:
-            loss_consistency = losses.loss_consistency(*outputs)
+            loss_consistency = losses.loss_consistency(outputs[1], outputs[0])
         else:
             loss_consistency = torch.tensor(0.0).to(outputs[0])
 
