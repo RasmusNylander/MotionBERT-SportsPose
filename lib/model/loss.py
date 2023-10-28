@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
+from lib.model.loss_utils import SVD
+
+svd = SVD.apply
 
 # Numpy-based errors
 
@@ -98,7 +101,7 @@ def loss_2d_weighted(predicted, target, conf):
     assert predicted.shape == target.shape
     predicted_2d = predicted[:, :, :, :2]
     target_2d = target[:, :, :, :2]
-    diff = (predicted_2d - target_2d) * conf
+    diff = (predicted_2d - target_2d) * conf.unsqueeze(-1)
     return torch.mean(torch.norm(diff, dim=-1))
 
 
@@ -275,7 +278,7 @@ def loss_angle_velocity(x, gt):
 
 def loss_consistency(v1, v2):
     """
-    Loss penalizes if two pose sequences from different views are'nt equal under a rigid transformation.
+    Loss penalizes if two pose sequences from different views aren't equal under a rigid transformation.
     """
     assert v1.shape == v2.shape
 
@@ -311,11 +314,15 @@ def rigid_transform_3D(A, B):
     centroid_A = torch.mean(A, dim=0)
     centroid_B = torch.mean(B, dim=0)
     H = torch.mm((A - centroid_A).t(), B - centroid_B) / n
-    U, s, V = torch.svd(H)
+    U, s, V = svd(H)
     R = torch.mm(V, U.t())
     if torch.det(R) < 0:
+        V = V.clone()
+        s = s.clone()
+
         s[-1] = -s[-1]
         V[:, 2] = -V[:, 2]
+
         R = torch.mm(V, U.t())
 
     varP = torch.var(A, dim=0).sum()

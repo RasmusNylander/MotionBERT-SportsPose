@@ -446,6 +446,8 @@ class MotionBertSportPose(pl.LightningModule):
         lambda_av=1.0,
         lambda_consistency=1.0,
         lambda_3d_pos=1.0,
+        lambda_2d_pos=1.0,
+        use_3d_data=True,
     ) -> None:
         super().__init__()
 
@@ -463,6 +465,8 @@ class MotionBertSportPose(pl.LightningModule):
         self.lambda_av = lambda_av
         self.lambda_consistency = lambda_consistency
         self.lambda_3d_pos = lambda_3d_pos
+        self.lambda_2d_pos = lambda_2d_pos
+        self.use_3d_data = use_3d_data
 
         self.model = DSTformer(
             dim_in=3,
@@ -538,24 +542,31 @@ class MotionBertSportPose(pl.LightningModule):
         pose2d = torch.cat(pose2ds, dim=0)
 
         # 3D Loses
-        loss_3d_pos = losses.loss_mpjpe(output, target3d)
-        loss_3d_scale = losses.n_mpjpe(output, target3d)
-        loss_3d_velocity = losses.loss_velocity(output, target3d)
-        loss_limb_variation = losses.loss_limb_var(output)
-        loss_limb_gt = losses.loss_limb_gt(output, target3d)
-        loss_angle = losses.loss_angle(output, target3d)
-        loss_angle_velocity = losses.loss_angle_velocity(output, target3d)
+        if self.use_3d_data:
+            loss_3d_pos = losses.loss_mpjpe(output, target3d)
+            loss_3d_scale = losses.n_mpjpe(output, target3d)
+            loss_3d_velocity = losses.loss_velocity(output, target3d)
+            loss_limb_variation = losses.loss_limb_var(output)
+            loss_limb_gt = losses.loss_limb_gt(output, target3d)
+            loss_angle = losses.loss_angle(output, target3d)
+            loss_angle_velocity = losses.loss_angle_velocity(output, target3d)
 
-        loss_total = (
-            loss_3d_pos * self.lambda_3d_pos
-            + self.lambda_scale * loss_3d_scale
-            + self.lambda_3d_velocity * loss_3d_velocity
-            + self.lambda_lv * loss_limb_variation
-            + self.lambda_lg * loss_limb_gt
-            + self.lambda_a * loss_angle
-            + self.lambda_av * loss_angle_velocity
-            + self.lambda_consistency * loss_consistency
-        )
+            loss_total = (
+                loss_3d_pos * self.lambda_3d_pos
+                + self.lambda_scale * loss_3d_scale
+                + self.lambda_3d_velocity * loss_3d_velocity
+                + self.lambda_lv * loss_limb_variation
+                + self.lambda_lg * loss_limb_gt
+                + self.lambda_a * loss_angle
+                + self.lambda_av * loss_angle_velocity
+                + self.lambda_consistency * loss_consistency
+            )
+        else:
+            loss_2d_pos = losses.loss_2d_weighted(output, target3d, pose2d[..., 2])
+            loss_total = (
+                loss_2d_pos * self.lambda_2d_pos
+                + self.lambda_consistency * loss_consistency
+            )
 
         if False:
             print("Losses:")
@@ -582,13 +593,17 @@ class MotionBertSportPose(pl.LightningModule):
             print(loss_total)
 
         # Log 3D losses
-        self.log("train/loss_3d_pos", loss_3d_pos, on_epoch=True)
-        self.log("train/loss_3d_scale", loss_3d_scale, on_epoch=True)
-        self.log("train/loss_3d_velocity", loss_3d_velocity, on_epoch=True)
-        self.log("train/loss_limb_variation", loss_limb_variation, on_epoch=True)
-        self.log("train/loss_limb_gt", loss_limb_gt, on_epoch=True)
-        self.log("train/loss_angle", loss_angle, on_epoch=True)
-        self.log("train/loss_angle_velocity", loss_angle_velocity, on_epoch=True)
+        if self.use_3d_data:
+            self.log("train/loss_3d_pos", loss_3d_pos, on_epoch=True)
+            self.log("train/loss_3d_scale", loss_3d_scale, on_epoch=True)
+            self.log("train/loss_3d_velocity", loss_3d_velocity, on_epoch=True)
+            self.log("train/loss_limb_variation", loss_limb_variation, on_epoch=True)
+            self.log("train/loss_limb_gt", loss_limb_gt, on_epoch=True)
+            self.log("train/loss_angle", loss_angle, on_epoch=True)
+            self.log("train/loss_angle_velocity", loss_angle_velocity, on_epoch=True)
+        else:
+            self.log("train/loss_2d_pos", loss_2d_pos, on_epoch=True)
+
         self.log("train/loss_total", loss_total, on_epoch=True)
         self.log("train/loss_consistency", loss_consistency, on_epoch=True)
 
