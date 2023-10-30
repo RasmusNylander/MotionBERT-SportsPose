@@ -15,6 +15,7 @@ from mpl_toolkits.mplot3d import Axes3D
 import os
 from trackman.posetools.data.datasets import AbstractImageDataset
 from lightning.pytorch.cli import LightningCLI
+import itertools
 
 
 def get_wandb_video_from_joints(joints, fps=30):
@@ -529,10 +530,14 @@ class MotionBertSportPose(pl.LightningModule):
             outputs.append(output)
 
         # Consistency loss
+        loss_consistency = torch.tensor(0.0).to(outputs[0])
         if len(outputs) > 1:
-            loss_consistency = losses.loss_consistency(outputs[1], outputs[0])
-        else:
-            loss_consistency = torch.tensor(0.0).to(outputs[0])
+            # Loop through all pairs of outputs using itertools
+            for output1, output2 in itertools.combinations(outputs, 2):
+                loss_consistency += losses.loss_consistency(output1, output2)
+
+            # Take average of all consistency losses between all pairs of outputs
+            loss_consistency /= len(list(itertools.combinations(outputs, 2)))
 
         # Recombine values for easier loss calculation
         output = torch.cat(outputs, dim=0)
@@ -897,6 +902,10 @@ class SportsPoseDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.include_debug_images = include_debug_images
 
+        self.test_batch_size = (
+            int(len(self.views) / len(self.test_views)) * self.batch_size
+        )
+
         # Define data split
         self.test_subjects = ["mje", "mzm", "shs"]
         self.val_subjects = ["orb", "mhp", "mhs", "cin", "ufh"]
@@ -975,9 +984,9 @@ class SportsPoseDataModule(pl.LightningDataModule):
     def val_dataloader(self):
         return utils.data.DataLoader(
             self.val_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.test_batch_size,
             shuffle=False,
-            num_workers=self.batch_size,
+            num_workers=self.test_batch_size,
             persistent_workers=True,
             pin_memory=True,
         )
@@ -985,9 +994,9 @@ class SportsPoseDataModule(pl.LightningDataModule):
     def test_dataloader(self):
         return utils.data.DataLoader(
             self.test_dataset,
-            batch_size=self.batch_size,
+            batch_size=self.test_batch_size,
             shuffle=False,
-            num_workers=self.batch_size,
+            num_workers=self.test_batch_size,
             persistent_workers=True,
             pin_memory=True,
         )
@@ -996,6 +1005,9 @@ class SportsPoseDataModule(pl.LightningDataModule):
 class CustomLightningCLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.add_argument("--sweep", default=False)
+        parser.link_arguments("model.views", "data.views")
+        parser.link_arguments("model.test_views", "data.test_views")
+        parser.link_arguments("model.batch_size", "data.batch_size")
 
 
 def main():
