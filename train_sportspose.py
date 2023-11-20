@@ -496,6 +496,13 @@ class MotionBertSportPose(pl.LightningModule):
         self.val_step_gt = []
         self.test_step_denorm_outputs = []
         self.test_step_gt = []
+        self.full_meta_data_gt = {}
+        self.full_meta_data_denorm = {}
+        self.partial_meta_data_gt = {}
+        self.partial_meta_data_denorm = {}
+
+    def forward(self, x):
+        return self.model(x)
 
     def training_step(self, batch, batch_idx):
         # Get camera and 3d pose in world coordinate
@@ -795,6 +802,29 @@ class MotionBertSportPose(pl.LightningModule):
             self.test_step_denorm_outputs.append(output_denorm)
             self.test_step_gt.append(j3d_image)
 
+            """
+            for person_id in batch["metadata"]["person_id"]:
+                if person_id not in self.full_meta_data_gt.keys():
+                    self.full_meta_data_gt[batch["metadata"]["person_id"]] = {}
+                    self.full_meta_data_denorm[batch["metadata"]["person_id"]] = {}
+
+                for activity in batch["metadata"]["activity"]:
+                    if activity not in self.full_meta_data_gt[person_id].keys():
+                        self.full_meta_data_gt[person_id][activity] = []
+                        self.full_meta_data_denorm[person_id][activity] = []
+            """
+            for batch_num, activity in enumerate(batch["metadata"]["activity"]):
+                if activity not in self.partial_meta_data_gt.keys():
+                    self.partial_meta_data_gt[activity] = []
+                    self.partial_meta_data_denorm[activity] = []
+
+                self.partial_meta_data_gt[activity].append(
+                    j3d_image[batch_num, ...].unsqueeze(0)
+                )
+                self.partial_meta_data_denorm[activity].append(
+                    output_denorm[batch_num, ...].unsqueeze(0)
+                )
+
             target3ds.append(target3d)
             j3d_cams.append(j3d_cam)
             j3d_images.append(j3d_image)
@@ -881,9 +911,35 @@ class MotionBertSportPose(pl.LightningModule):
         self.log("test/mpjpe", mpjpe)
         self.log("test/pampjpe", pampjpe)
 
+        # Do the same computations for the partial metadata, i.e compute metrics for each activity
+        partial_mpjpe = {}
+        partial_pampjpe = {}
+        for activity in self.partial_meta_data_gt.keys():
+            # Align by root joint
+            partial_test_preds = torch.cat(self.partial_meta_data_denorm[activity])
+            partial_gt = torch.cat(self.partial_meta_data_gt[activity])
+
+            partial_test_preds = partial_test_preds - partial_test_preds[:, :, 0:1, :]
+            partial_gt = partial_gt - partial_gt[:, :, 0:1, :]
+
+            partial_test_preds = partial_test_preds.cpu().numpy()
+            partial_gt = partial_gt.cpu().numpy()
+
+            # Calculate MPJPE and Procrustes aligned MPJPE
+            partial_mpjpe[activity] = losses.mpjpe(partial_test_preds, partial_gt)
+            partial_pampjpe[activity] = losses.p_mpjpe(partial_test_preds, partial_gt)
+
+            # Log MPJPE and PAMPJPE
+            self.log(f"test/{activity}/mpjpe", partial_mpjpe[activity])
+            self.log(f"test/{activity}/pampjpe", partial_pampjpe[activity])
+
         # Clear variables
         self.test_step_denorm_outputs.clear()
         self.test_step_gt.clear()
+        self.full_meta_data_gt.clear()
+        self.full_meta_data_denorm.clear()
+        self.partial_meta_data_gt.clear()
+        self.partial_meta_data_denorm.clear()
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
@@ -919,6 +975,7 @@ class SportsPoseDataModule(pl.LightningDataModule):
             "metadata": {
                 "file_name": True,
                 "person_id": True,
+                "activity": True,
             },
             "video": {
                 "view": {
