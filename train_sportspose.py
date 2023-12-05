@@ -19,13 +19,9 @@ import itertools
 
 
 def get_wandb_video_from_joints(joints, fps=30):
-    frames = []
-    for pose in joints:
-        frames.append(visualize_3d_pose(pose))
-    frames = np.asarray(frames)
-
+    frames = np.asarray([visualize_3d_pose(pose) for pose in joints])
     # Flip axis to (time, channel, height, width)
-    frames = np.transpose(frames, (0, 3, 1, 2))
+    frames = frames.transpose((0, 3, 1, 2))
 
     return wandb.Video(frames, fps=fps, format="gif")
 
