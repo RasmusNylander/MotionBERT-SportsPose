@@ -176,7 +176,7 @@ def coco2h36m(x):
 
 
 def _infer_box(
-    pose3d: torch.tensor, fx: float, fy: float, cx: float, cy: float, rootIdx: int = 0
+    pose3d: torch.Tensor, fx: float, fy: float, cx: float, cy: float, rootIdx: int = 0
 ):
     """
     Infers the bounding box of a 3D pose in 2D space.
@@ -219,8 +219,8 @@ def _weak_project(pose3d, fx, fy, cx, cy):
 
 
 def camera2image_coordinates(
-    pose3d: torch.tensor,
-    box: torch.tensor,
+    pose3d: torch.Tensor,
+    box: torch.Tensor,
     fx: float,
     fy: float,
     cx: float,
@@ -237,7 +237,7 @@ def camera2image_coordinates(
 
 
 def rotate_3d_pose_90_clockwise(
-    pose3d: torch.tensor,
+    pose3d: torch.Tensor,
     numtimesrot90clockwise: int,
 ):
     """
