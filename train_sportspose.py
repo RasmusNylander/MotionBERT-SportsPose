@@ -2,7 +2,6 @@ import torch
 from torch import nn, optim, utils
 from typing import Any
 import lightning.pytorch as pl
-from lib.model.DSTformer import DSTformer
 import lib.model.loss as losses
 from functools import partial
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import os
 from trackman.posetools.data.datasets import AbstractImageDataset
+from trackman.posetools.models.DSTformer import DSTformer
 from lightning.pytorch.cli import LightningCLI
 import itertools
 
